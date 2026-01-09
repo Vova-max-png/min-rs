@@ -8,7 +8,7 @@ authors = ["BadCoder"]
 readme="README.md"
 repository="https://github.com/Vova-max-png/min-rs"
 keywords = ["max", "messenger"]
-exclude=["/target"]
+exclude=["/target", "/test_files"]
 
 [dependencies]
 futures-util = "0.3.31"
@@ -16,3 +16,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.145"
+min-rs-config = "0.1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

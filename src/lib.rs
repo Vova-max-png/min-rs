@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Error};
 use tokio::sync::mpsc::Sender;
+use min_rs_config::UserAgent;
 
 use futures_util::{
     StreamExt,
@@ -14,21 +15,6 @@ use tokio_tungstenite::{
         protocol::Message,
     },
 };
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UserAgent {
-    pub app_version: String,
-    pub device_locale: String,
-    pub device_name: String,
-    pub device_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub header_user_agent: Option<String>,
-    pub locale: String,
-    pub os_version: String,
-    pub screen: String,
-    pub timezone: String,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -362,5 +348,27 @@ impl Provider {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::test;
+    use min_rs_config::*;
+
+    use crate::Provider;
+
+    #[test]
+    async fn test_async_operation() {
+        // Parse config file
+        let config = ConfigParser::parse_config_file("test_files/config.json").unwrap();
+
+        // Create a test channel for communication
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+        // Initialize the provider with the config and channel
+        let provider = Provider::new(serde_json::to_string(&config.headers).unwrap(), "wss://ws-api.oneme.ru/websocket".to_string(), tx).await.unwrap();
+    
+        
     }
 }
