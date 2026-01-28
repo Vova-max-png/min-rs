@@ -1,5 +1,7 @@
 # min-rs
 
+### min-rs is a crate for easy working with reverse-engineered max's api
+
 ## min-rs idea
 
 ### Recently I decided that I need to create a free library to work with max's api directly, because there is still no official one. I started working on this project locally first, but then decided to share the code with rust community, so now you see this readme.md file. The main goal of this project is to facilitate the work with max and their backend servers.
