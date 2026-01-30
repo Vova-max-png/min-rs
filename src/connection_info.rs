@@ -6,6 +6,7 @@ pub enum ConnectionStatus {
     Connected,
 }
 
+/// Connection info struct is used to control connection state
 #[derive(PartialEq, Clone, Debug)]
 pub struct ConnectionInfo {
     status: ConnectionStatus,

@@ -1,9 +1,9 @@
 use min_rs_config::UserAgent;
-use std::{collections::HashMap, error::Error, fmt, hash::Hash, sync::Arc, time::Duration};
+use std::{collections::HashMap, hash::Hash, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc::Sender};
 
 use futures_util::{
-    StreamExt, TryStreamExt,
+    StreamExt,
     sink::SinkExt,
     stream::{SplitSink, SplitStream},
 };
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
-        http::{Request, Response, response},
+        http::Request,
         protocol::Message,
     },
 };
@@ -57,6 +57,8 @@ pub struct Data {
     pub get_messages: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_ids: Option<Vec<String>>,
 }
 
 impl Default for Data {
@@ -77,6 +79,7 @@ impl Default for Data {
             from: None,
             get_messages: None,
             message_id: None,
+            message_ids: None,
         }
     }
 }
@@ -262,23 +265,26 @@ pub struct ResponseHeaders {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct SeqType {
     cmd: i8,
-    opcode: i64
+    opcode: i64,
 }
 
 #[derive(Clone, Deserialize)]
 pub struct SequenceHandler {
-    values: HashMap<SeqType, i64>
+    values: HashMap<SeqType, i64>,
 }
 
 impl SequenceHandler {
     pub fn new() -> Self {
         Self {
-            values: HashMap::new()
+            values: HashMap::new(),
         }
     }
 
     pub fn increase_seq(&mut self, opcode: i64, cmd: i8) {
-        let seq_type = SeqType { cmd: cmd, opcode: opcode };
+        let seq_type = SeqType {
+            cmd: cmd,
+            opcode: opcode,
+        };
         let clone = seq_type.clone();
         let value_to_insert = match self.values.get(&clone) {
             Some(val) => val + 1,
@@ -289,12 +295,15 @@ impl SequenceHandler {
         };
         self.values.insert(seq_type, value_to_insert);
     }
-    
+
     pub fn get_seq(&mut self, opcode: i64, cmd: i8) -> i64 {
-        let seq_type = SeqType { cmd: cmd, opcode: opcode };
+        let seq_type = SeqType {
+            cmd: cmd,
+            opcode: opcode,
+        };
         let value = match self.values.get(&seq_type) {
             Some(val) => *val,
-            None => 0
+            None => 0,
         };
         value
     }
@@ -378,7 +387,7 @@ pub struct Provider {
     user_agent: Data,
     auth_data: Data,
     connection_info: ConnectionInfo,
-    named_identifiers: HashMap<i64, String>
+    named_identifiers: HashMap<i64, String>,
 }
 
 impl Provider {
@@ -406,7 +415,7 @@ impl Provider {
             user_agent,
             auth_data,
             connection_info: ConnectionInfo::new(),
-            named_identifiers: HashMap::new()
+            named_identifiers: HashMap::new(),
         })
     }
 
@@ -449,12 +458,15 @@ impl Provider {
         let raw_data = serde_json::to_string(&state_copy)?;
         match self.write_to_stream(raw_data).await {
             Err(e) => {
-                println!("Failed to write into stream: {}. Initializing new session...", e);
+                println!(
+                    "Failed to write into stream: {}. Initializing new session...",
+                    e
+                );
                 self.init_new_session().await?;
-            },
+            }
             _ => {}
         };
-        
+
         self.state.increase_seq();
 
         Ok(())
@@ -473,8 +485,10 @@ impl Provider {
                 println!("Reconnection failed: {}", e);
             }
         }
-        
-        let stream = connect_to_servers(self.headers.clone(), self.uri.clone()).await.unwrap();
+
+        let stream = connect_to_servers(self.headers.clone(), self.uri.clone())
+            .await
+            .unwrap();
 
         println!("Closing old connection...");
         self.write.lock().await.close().await?;
@@ -540,7 +554,8 @@ impl Provider {
                 }
             }
             for contact in response.payload.contacts.unwrap().iter() {
-                self.named_identifiers.insert(contact.id, contact.names[0].name.clone());
+                self.named_identifiers
+                    .insert(contact.id, contact.names[0].name.clone());
             }
             println!("{:#?}", self.named_identifiers);
         }
@@ -566,28 +581,48 @@ impl Provider {
         }
         if headers.opcode == 128 {
             let data: ResponseState = serde_json::from_str(&text).unwrap();
+            
+            let id = match data.payload.message.clone().unwrap().sender {
+                Some(id) => id,
+                None => data.payload.chat_id.unwrap()
+            };
 
-            let name = self.get_name_by_id(data.payload.chat_id.unwrap());
-
-            let tg_text = format!(
-                "{}\n\n{}",
-                name,
-                data.payload.message.clone().unwrap().text
+            println!(
+                "Answer to message:\nChat id: {}\nMsg id: {}",
+                id,
+                data.payload.message.clone().unwrap().id
             );
+
+            let name = self.get_name_by_id(id);
+
+            let tg_text = format!("{}\n\n{}", name, data.payload.message.clone().unwrap().text);
 
             self.tx.send(tg_text).await.unwrap();
 
             // Answer to max that we have received the message
-            println!("Answer to message:\nChat id: {}\nMsg id: {}", data.payload.chat_id.unwrap(),
-                data.payload.message.clone().unwrap().id);
             self.send_data(
                 Data {
                     chat_id: data.payload.chat_id,
-                    message_id: Some(data.payload.message.unwrap().id),
+                    message_id: Some(data.payload.message.clone().unwrap().id),
                     ..Default::default()
                 },
                 128,
                 1,
+            )
+            .await
+            .unwrap();
+
+            let mut msg_ids = Vec::new();
+            msg_ids.push(data.payload.message.unwrap().id);
+
+            self.send_data(
+                Data {
+                    chat_id: data.payload.chat_id,
+                    message_ids: Some(msg_ids),
+                    ..Default::default()
+                },
+                74,
+                0,
             )
             .await
             .unwrap();
@@ -599,13 +634,12 @@ impl Provider {
     }
 
     fn get_name_by_id(&self, id: i64) -> String {
-        let result = self.named_identifiers.get(&id).unwrap().to_string(); 
+        let result = self.named_identifiers.get(&id).unwrap().to_string();
 
         result
     }
 
     async fn accept_interactions(&mut self) -> Result<(), Box<AsyncError>> {
-        tokio::time::sleep(Duration::from_secs(30)).await;
         println!("Sending interactable true");
         self.send_data(
             Data {
@@ -661,7 +695,7 @@ mod tests {
         };
 
         // Initialize the provider with the config and channel
-        let provider = Provider::new(
+        let _provider = Provider::new(
             serde_json::to_string(&config.headers).unwrap(),
             "wss://ws-api.oneme.ru/websocket".to_string(),
             tx,
