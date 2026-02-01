@@ -217,7 +217,7 @@ pub struct Contact {
 pub struct MaxMessage {
     id: String,
     sender: Option<i64>,
-    text: String,
+    pub text: String,
     time: usize,
     #[serde(rename = "type")]
     typ: String,
@@ -239,7 +239,7 @@ pub struct MaxResponse {
     chats: Option<Vec<MaxChat>>,
     contacts: Option<Vec<Contact>>,
     messages: Option<MaybeEmpty<Vec<MaxMessage>>>,
-    message: Option<MaxMessage>,
+    pub message: Option<MaxMessage>,
     chat_id: Option<i64>,
 }
 
@@ -388,6 +388,7 @@ pub struct Provider {
     auth_data: Data,
     connection_info: ConnectionInfo,
     named_identifiers: HashMap<i64, String>,
+    handler: Option<Box<dyn Fn(ResponseState) + Send + 'static>>
 }
 
 impl Provider {
@@ -416,14 +417,21 @@ impl Provider {
             auth_data,
             connection_info: ConnectionInfo::new(),
             named_identifiers: HashMap::new(),
+            handler: None
         })
     }
 
+    pub fn attach_handler(mut self, f: fn(ResponseState)) -> Self {
+        self.handler = Some(Box::new(f));
+
+        self
+    }
+
     pub async fn auth(&mut self) -> Result<(), Box<AsyncError>> {
-        println!(
-            "Authenticating with data: {:#?}\n{:#?}",
-            self.user_agent, self.auth_data
-        );
+        // println!(
+        //     "Authenticating with data: {:#?}\n{:#?}",
+        //     self.user_agent, self.auth_data
+        // );
         self.state.sequence_handler.reset();
         self.state.set_opcode(6);
         let mut user_agent_state = self.state.clone();
@@ -454,14 +462,14 @@ impl Provider {
         self.state.sync_seq();
         let mut state_copy = self.state.clone();
         state_copy.payload = Some(data);
-        println!("Seq: {}", state_copy.seq);
+        // println!("Seq: {}", state_copy.seq);
         let raw_data = serde_json::to_string(&state_copy)?;
         match self.write_to_stream(raw_data).await {
             Err(e) => {
-                println!(
-                    "Failed to write into stream: {}. Initializing new session...",
-                    e
-                );
+                // println!(
+                //     "Failed to write into stream: {}. Initializing new session...",
+                //     e
+                // );
                 self.init_new_session().await?;
             }
             _ => {}
@@ -482,17 +490,18 @@ impl Provider {
         match self.connection_info.increase_retries() {
             Ok(_) => {}
             Err(e) => {
-                println!("Reconnection failed: {}", e);
+                // println!("Reconnection failed: {}", e);
+                // std::process::exit(-1);
             }
         }
+
+        // println!("Closing old connection...");
+        self.write.lock().await.close().await?;
+        // println!("Old connection closed. Establishing new one...");
 
         let stream = connect_to_servers(self.headers.clone(), self.uri.clone())
             .await
             .unwrap();
-
-        println!("Closing old connection...");
-        self.write.lock().await.close().await?;
-        println!("Old connection closed. Establishing new one...");
 
         let (write, read) = stream.split();
 
@@ -504,19 +513,45 @@ impl Provider {
         Ok(())
     }
 
-    pub async fn handle_everything(&mut self) -> Result<(), Box<AsyncError>> {
+    pub async fn handle_everything(self) -> Result<(), Box<AsyncError>> {
         let mut interaction_interval = tokio::time::interval(Duration::from_secs(30));
 
+        let shared_self = Arc::new(Mutex::new(self));
+        let shared_for_task = shared_self.clone();
+
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut locked_self = shared_for_task.lock().await;
+                    if let Err(e) = locked_self.handle_messages().await {
+                        // eprintln!("Error handling messages: {}", e);
+                        break;
+                    }
+                }
+                
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
         loop {
-            tokio::select! {
-                result = self.handle_messages() => {
-                    result?;
-                }
-                _ = interaction_interval.tick() => {
-                    self.accept_interactions().await?;
-                }
+            interaction_interval.tick().await;
+            
+            {
+                let mut locked_self = shared_self.lock().await;
+                locked_self.accept_interactions().await?;
             }
         }
+
+        // loop {
+        //     tokio::select! {
+        //         result = self.handle_messages() => {
+        //             result?;
+        //         }
+        //         _ = interaction_interval.tick() => {
+        //             self.accept_interactions().await?;
+        //         }
+        //     }
+        // }
     }
 
     async fn handle_messages(&mut self) -> Result<(), Box<AsyncError>> {
@@ -526,26 +561,26 @@ impl Provider {
             guard.next().await
         } {
             Some(Ok(Message::Text(text))) => {
-                println!("Read from stream: {}", text);
+                // println!("Read from stream: {}", text);
                 text
             }
             Some(Err(e)) => {
-                println!("Error: {}. Initializing new session...", e);
+                // println!("Error: {}. Initializing new session...", e);
                 self.init_new_session().await?;
                 return Ok(());
             }
             Some(_) => {
-                println!("Got something weird");
+                // println!("Got something weird");
                 return Ok(());
             }
             None => {
-                println!("Stream is closed!");
+                // println!("Stream is closed!");
                 return Ok(());
             }
         };
         let headers: ResponseHeaders = serde_json::from_str(&text).unwrap();
         if headers.opcode == 19 {
-            println!("{}", &text);
+            // println!("{}", &text);
             let response: ResponseState = serde_json::from_str(&text).unwrap();
             self.full_data = Some(response.clone());
             for chat in response.payload.chats.unwrap().iter() {
@@ -557,7 +592,7 @@ impl Provider {
                 self.named_identifiers
                     .insert(contact.id, contact.names[0].name.clone());
             }
-            println!("{:#?}", self.named_identifiers);
+            // println!("{:#?}", self.named_identifiers);
         }
         if headers.opcode == 49 {
             let response: ResponseState = serde_json::from_str(&text).unwrap();
@@ -574,24 +609,28 @@ impl Provider {
                         }
                     }
                     MaybeEmpty::Empty {} => {
-                        println!("Empty message encountered");
+                        // println!("Empty message encountered");
                     }
                 }
             }
         }
         if headers.opcode == 128 {
             let data: ResponseState = serde_json::from_str(&text).unwrap();
+            match &self.handler {
+                Some(f) => f(data.clone()),
+                None => {}
+            };
             
             let id = match data.payload.message.clone().unwrap().sender {
                 Some(id) => id,
                 None => data.payload.chat_id.unwrap()
             };
 
-            println!(
-                "Answer to message:\nChat id: {}\nMsg id: {}",
-                id,
-                data.payload.message.clone().unwrap().id
-            );
+            // println!(
+            //     "Answer to message:\nChat id: {}\nMsg id: {}",
+            //     id,
+            //     data.payload.message.clone().unwrap().id
+            // );
 
             let name = self.get_name_by_id(id);
 
@@ -640,7 +679,7 @@ impl Provider {
     }
 
     async fn accept_interactions(&mut self) -> Result<(), Box<AsyncError>> {
-        println!("Sending interactable true");
+        // println!("Sending interactable true");
         self.send_data(
             Data {
                 interactive: Some(true),
