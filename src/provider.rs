@@ -1,5 +1,5 @@
 use min_rs_config::UserAgent;
-use std::{collections::HashMap, hash::Hash, sync::Arc, time::Duration};
+use std::{collections::HashMap, hash::Hash, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc::Sender};
 
 use futures_util::{
@@ -10,10 +10,7 @@ use futures_util::{
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{
-        http::Request,
-        protocol::Message,
-    },
+    tungstenite::{http::Request, protocol::Message},
 };
 
 use crate::connection_info::ConnectionInfo;
@@ -217,6 +214,8 @@ pub struct Contact {
 pub struct MaxMessage {
     id: String,
     sender: Option<i64>,
+    #[serde(skip)]
+    pub sender_name: Option<String>,
     pub text: String,
     time: usize,
     #[serde(rename = "type")]
@@ -371,10 +370,55 @@ pub async fn connect_to_servers(
     Ok(stream)
 }
 
+async fn check_payload_field<F>(
+    field: Option<F>,
+    field_name: String,
+) -> Result<F, Box<AsyncError>> {
+    match field {
+        Some(f) => Ok(f),
+        None => {
+            #[cfg(debug_assertions)]
+            println!("One of payload fields is empty");
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Field '{}' is required", field_name),
+            )))
+        }
+    }
+}
+
 /// Provider is the main struct to work with max's reverse engineered api
 /// Here is an example of usage:
 /// '''
+///let user_agent_data = Data {
+///    device_id: Some(Uuid::new_v4().to_string()),
+///    user_agent: Some(config.max_agent),
+///    ..Default::default()
+///};
 ///
+///let auth_data = Data {
+///    chats_count: Some(40),
+///    chats_sync: Some(0),
+///    contacts_sync: Some(0),
+///    drafts_sync: Some(0),
+///    interactive: Some(true),
+///    presence_sync: Some(-1),
+///    token: Some(token.to_string()),
+///    ..Default::default()
+///};
+///
+///let mut provider =
+///    MaxProvider::new(
+///        serde_json::to_string(&config.headers)?,
+///        "wss://ws-api.oneme.ru/websocket".to_string(),
+///        tx,
+///        user_agent_data,
+///        auth_data,
+///    )
+///    .await?
+///    .attach_handler(|response| {
+///        println!("{}", response.payload.message.unwrap().text);
+///    });
 /// '''
 pub struct Provider {
     read: Arc<Mutex<SplitedStream>>,
@@ -383,19 +427,24 @@ pub struct Provider {
     uri: String,
     state: RequestState,
     full_data: Option<ResponseState>,
-    tx: Sender<String>,
     user_agent: Data,
     auth_data: Data,
     connection_info: ConnectionInfo,
     named_identifiers: HashMap<i64, String>,
-    handler: Option<Box<dyn Fn(ResponseState) + Send + 'static>>
+    handler: Option<
+        Box<
+            dyn Fn(ResponseState) -> Pin<Box<dyn Future<Output = ()> + Send>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
 }
 
 impl Provider {
     pub async fn new(
         headers: String,
         uri: String,
-        tx: Sender<String>,
         user_agent: Data,
         auth_data: Data,
     ) -> Result<Self, Box<AsyncError>> {
@@ -410,28 +459,27 @@ impl Provider {
             write: Arc::new(Mutex::new(write)),
             state,
             full_data: None,
-            tx,
             headers,
             uri,
             user_agent,
             auth_data,
             connection_info: ConnectionInfo::new(),
             named_identifiers: HashMap::new(),
-            handler: None
+            handler: None,
         })
     }
 
-    pub fn attach_handler(mut self, f: fn(ResponseState)) -> Self {
-        self.handler = Some(Box::new(f));
+    pub fn attach_handler<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(ResponseState) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.handler = Some(Box::new(move |state| Box::pin(f(state))));
 
         self
     }
 
     pub async fn auth(&mut self) -> Result<(), Box<AsyncError>> {
-        // println!(
-        //     "Authenticating with data: {:#?}\n{:#?}",
-        //     self.user_agent, self.auth_data
-        // );
         self.state.sequence_handler.reset();
         self.state.set_opcode(6);
         let mut user_agent_state = self.state.clone();
@@ -462,14 +510,9 @@ impl Provider {
         self.state.sync_seq();
         let mut state_copy = self.state.clone();
         state_copy.payload = Some(data);
-        // println!("Seq: {}", state_copy.seq);
         let raw_data = serde_json::to_string(&state_copy)?;
         match self.write_to_stream(raw_data).await {
-            Err(e) => {
-                // println!(
-                //     "Failed to write into stream: {}. Initializing new session...",
-                //     e
-                // );
+            Err(_) => {
                 self.init_new_session().await?;
             }
             _ => {}
@@ -489,19 +532,14 @@ impl Provider {
     async fn init_new_session(&mut self) -> Result<(), Box<AsyncError>> {
         match self.connection_info.increase_retries() {
             Ok(_) => {}
-            Err(e) => {
-                // println!("Reconnection failed: {}", e);
+            Err(_) => {
                 // std::process::exit(-1);
             }
         }
 
-        // println!("Closing old connection...");
-        self.write.lock().await.close().await?;
-        // println!("Old connection closed. Establishing new one...");
+        let _ = self.write.lock().await.close().await;
 
-        let stream = connect_to_servers(self.headers.clone(), self.uri.clone())
-            .await
-            .unwrap();
+        let stream = connect_to_servers(self.headers.clone(), self.uri.clone()).await?;
 
         let (write, read) = stream.split();
 
@@ -524,34 +562,23 @@ impl Provider {
                 {
                     let mut locked_self = shared_for_task.lock().await;
                     if let Err(e) = locked_self.handle_messages().await {
-                        // eprintln!("Error handling messages: {}", e);
+                        println!("Handle messages error: {}", e);
                         break;
                     }
                 }
-                
+
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
 
         loop {
             interaction_interval.tick().await;
-            
+
             {
                 let mut locked_self = shared_self.lock().await;
                 locked_self.accept_interactions().await?;
             }
         }
-
-        // loop {
-        //     tokio::select! {
-        //         result = self.handle_messages() => {
-        //             result?;
-        //         }
-        //         _ = interaction_interval.tick() => {
-        //             self.accept_interactions().await?;
-        //         }
-        //     }
-        // }
     }
 
     async fn handle_messages(&mut self) -> Result<(), Box<AsyncError>> {
@@ -560,120 +587,189 @@ impl Provider {
             let mut guard = read_clone.lock().await;
             guard.next().await
         } {
-            Some(Ok(Message::Text(text))) => {
-                // println!("Read from stream: {}", text);
-                text
-            }
+            Some(Ok(Message::Text(text))) => text,
             Some(Err(e)) => {
-                // println!("Error: {}. Initializing new session...", e);
                 self.init_new_session().await?;
                 return Ok(());
             }
             Some(_) => {
-                // println!("Got something weird");
                 return Ok(());
             }
             None => {
-                // println!("Stream is closed!");
                 return Ok(());
             }
         };
-        let headers: ResponseHeaders = serde_json::from_str(&text).unwrap();
-        if headers.opcode == 19 {
-            // println!("{}", &text);
-            let response: ResponseState = serde_json::from_str(&text).unwrap();
-            self.full_data = Some(response.clone());
-            for chat in response.payload.chats.unwrap().iter() {
-                if let Some(title) = &chat.title {
-                    self.named_identifiers.insert(chat.id, title.to_string());
-                }
+        let headers: ResponseHeaders = match serde_json::from_str(&text) {
+            Ok(h) => h,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                println!("Couldn't parse response headers: {:#?}", e);
+                return Ok(());
             }
-            for contact in response.payload.contacts.unwrap().iter() {
+        };
+        let mut response: Option<ResponseState> = None;
+        let opcode = headers.opcode;
+        if opcode == 19 || opcode == 49 || opcode == 128 {
+            response = match serde_json::from_str(&text) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "Couldn't parse response state: {:#?}. Maybe payload is empty",
+                        e
+                    );
+                    return Ok(());
+                }
+            };
+        }
+        if opcode == 19 && response.clone().is_some() {
+            self.handle_data_response(response.clone().unwrap()).await?;
+        }
+        if opcode == 49 && response.clone().is_some() {
+            self.handle_returned_messages(response.clone().unwrap()).await?;
+        }
+        if opcode == 128 && response.clone().is_some() {
+            self.handle_incoming_message(response.unwrap()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_data_response(
+        &mut self, 
+        response: ResponseState
+    ) -> Result<(), Box<AsyncError>> {
+        self.full_data = Some(response.clone());
+        let chats = check_payload_field(
+            response.clone().payload.chats.clone(),
+            "chats".to_string(),
+        )
+        .await?;
+        for chat in chats.iter() {
+            if let Some(title) = &chat.title {
                 self.named_identifiers
-                    .insert(contact.id, contact.names[0].name.clone());
+                    .insert(chat.id.clone(), title.to_string());
             }
-            // println!("{:#?}", self.named_identifiers);
         }
-        if headers.opcode == 49 {
-            let response: ResponseState = serde_json::from_str(&text).unwrap();
-            if let Some(maybe_empty) = &response.payload.messages {
-                match maybe_empty {
-                    MaybeEmpty::Full(msgs) => {
-                        for message in msgs {
-                            let tg_text = format!(
-                                "Author: {}\nText: {}",
-                                message.sender.unwrap(),
-                                message.text
-                            );
-                            self.tx.send(tg_text).await.unwrap();
-                        }
-                    }
-                    MaybeEmpty::Empty {} => {
-                        // println!("Empty message encountered");
+        let contacts = check_payload_field(
+            response.clone().payload.contacts.clone(),
+            "contacts".to_string(),
+        )
+        .await?;
+        for contact in contacts.iter() {
+            self.named_identifiers
+                .insert(contact.id.clone(), contact.names[0].name.clone());
+        }
+
+        Ok(())
+    }
+
+    async fn handle_returned_messages(
+        &mut self,
+        response: ResponseState,
+    ) -> Result<(), Box<AsyncError>> {
+        if let Some(maybe_empty) = &response.clone().payload.messages {
+            match maybe_empty {
+                MaybeEmpty::Full(msgs) => {
+                    for message in msgs.clone().iter_mut() {
+                        let id = match message.sender {
+                            Some(id) => Some(id),
+                            None => response.clone().payload.chat_id,
+                        };
+
+                        let name = match id {
+                            Some(id) => self.get_name_by_id(id),
+                            None => {
+                                #[cfg(debug_assertions)]
+                                println!("Couldn't retrieve sender id from message.");
+                                return Ok(());
+                            }
+                        };
+
+                        message.sender_name = Some(name.clone());
+
+                        match &self.handler {
+                            Some(f) => f(response.clone()).await,
+                            None => {}
+                        };
                     }
                 }
+                MaybeEmpty::Empty {} => {}
             }
         }
-        if headers.opcode == 128 {
-            let data: ResponseState = serde_json::from_str(&text).unwrap();
-            match &self.handler {
-                Some(f) => f(data.clone()),
-                None => {}
-            };
-            
-            let id = match data.payload.message.clone().unwrap().sender {
-                Some(id) => id,
-                None => data.payload.chat_id.unwrap()
-            };
+        Ok(())
+    }
 
-            // println!(
-            //     "Answer to message:\nChat id: {}\nMsg id: {}",
-            //     id,
-            //     data.payload.message.clone().unwrap().id
-            // );
+    async fn handle_incoming_message(
+        &mut self,
+        mut response: ResponseState,
+    ) -> Result<(), Box<AsyncError>> {
+        let mut message = match response.clone().payload.message.clone() {
+            Some(msg) => msg,
+            None => {
+                #[cfg(debug_assertions)]
+                println!("Header is 128 and there is data, but message is None");
+                return Ok(());
+            }
+        };
 
-            let name = self.get_name_by_id(id);
+        let id = match message.sender {
+            Some(id) => Some(id),
+            None => response.clone().payload.chat_id,
+        };
 
-            let tg_text = format!("{}\n\n{}", name, data.payload.message.clone().unwrap().text);
+        let name = match id {
+            Some(id) => self.get_name_by_id(id),
+            None => {
+                #[cfg(debug_assertions)]
+                println!("Couldn't retrieve sender id from message.");
+                return Ok(());
+            }
+        };
 
-            self.tx.send(tg_text).await.unwrap();
+        message.sender_name = Some(name.clone());
 
-            // Answer to max that we have received the message
-            self.send_data(
-                Data {
-                    chat_id: data.payload.chat_id,
-                    message_id: Some(data.payload.message.clone().unwrap().id),
-                    ..Default::default()
-                },
-                128,
-                1,
-            )
-            .await
-            .unwrap();
+        response.payload.message = Some(message.clone());
 
-            let mut msg_ids = Vec::new();
-            msg_ids.push(data.payload.message.unwrap().id);
+        match &self.handler {
+            Some(f) => f(response.clone().clone()).await,
+            None => {}
+        };
 
-            self.send_data(
-                Data {
-                    chat_id: data.payload.chat_id,
-                    message_ids: Some(msg_ids),
-                    ..Default::default()
-                },
-                74,
-                0,
-            )
-            .await
-            .unwrap();
-        }
+        // Answer to max that we have received the message
+        self.send_data(
+            Data {
+                chat_id: response.clone().payload.chat_id,
+                message_id: Some(message.clone().id),
+                ..Default::default()
+            },
+            128,
+            1,
+        )
+        .await?;
 
-        // while let Some(Ok(Message::Text(text))) = read_clone.lock().await.next().await {}
+        let mut msg_ids = Vec::new();
+        msg_ids.push(message.id);
+
+        self.send_data(
+            Data {
+                chat_id: response.payload.chat_id,
+                message_ids: Some(msg_ids),
+                ..Default::default()
+            },
+            74,
+            0,
+        )
+        .await?;
 
         Ok(())
     }
 
     fn get_name_by_id(&self, id: i64) -> String {
-        let result = self.named_identifiers.get(&id).unwrap().to_string();
+        let result = match self.named_identifiers.get(&id) {
+            Some(n) => n.to_string(),
+            None => "Unknown".to_string(),
+        };
 
         result
     }
@@ -714,7 +810,7 @@ mod tests {
         let token = env::var("TOKEN").expect("Token is required in .env file!");
 
         // Create a test channel for communication
-        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        // let (tx, _rx) = tokio::sync::mpsc::channel(100);
 
         let user_agent_data = Data {
             device_id: Some("13977301-4cfd-4cb4-98b6-3536e0744015".to_string()),
@@ -737,7 +833,6 @@ mod tests {
         let _provider = Provider::new(
             serde_json::to_string(&config.headers).unwrap(),
             "wss://ws-api.oneme.ru/websocket".to_string(),
-            tx,
             user_agent_data,
             auth_data,
         )

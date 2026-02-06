@@ -7,7 +7,7 @@ description="A library to work with max's api directly through the sockets."
 authors = ["BadCoder"]
 readme="README.md"
 repository="https://github.com/Vova-max-png/min-rs"
-keywords = ["max", "messenger"]
+keywords = ["max", "messenger", "api", "backend"]
 exclude=["/target", "/test_files"]
 
 [dependencies]
