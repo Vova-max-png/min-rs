@@ -556,10 +556,9 @@ mod tests {
     use std::env;
 
     use dotenvy::dotenv;
-    use min_rs_config::*;
     use tokio::test;
 
-    use crate::{provider::{Data, Provider}, types::UserAgent};
+    use crate::{provider::{Data, Provider}, types::{Headers, UserAgent}};
 
     #[test]
     async fn test_async_operation() {
