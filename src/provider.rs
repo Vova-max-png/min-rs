@@ -284,7 +284,19 @@ impl Provider {
 
     async fn write_to_stream(&mut self, message: String) -> Result<(), Box<AsyncError>> {
         let write = self.write.clone();
-        write.lock().await.send(Message::Text(message)).await?;
+        match write.lock().await.send(Message::Text(message.clone())).await {
+            Ok(_) => {},
+            Err(_) => {
+                let stream = connect_to_servers(self.headers.clone(), self.uri.clone()).await?;
+
+                let (write, read) = stream.split();
+
+                self.write = Arc::new(Mutex::new(write));
+                self.read = Arc::new(Mutex::new(read));
+
+                self.write.lock().await.send(Message::Text(message)).await.expect("Couldn't send data even after establishing a new connection");
+            }
+        }
         Ok(())
     }
 
