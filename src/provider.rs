@@ -1,6 +1,5 @@
-use min_rs_config::UserAgent;
 use std::{collections::HashMap, hash::Hash, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, mpsc::Sender};
+use tokio::sync::Mutex;
 
 use futures_util::{
     StreamExt,
@@ -14,252 +13,12 @@ use tokio_tungstenite::{
 };
 
 use crate::connection_info::ConnectionInfo;
+use crate::types::*;
 
 type SplitedStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 type SplitedSink = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
 
 type AsyncError = dyn std::error::Error + Send + Sync;
-
-/// A common struct used to send requests to max's reverse-engineered backend
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Data {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interactive: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chats_count: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chats_sync: Option<i8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drafts_sync: Option<i8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_sync: Option<i8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contacts_sync: Option<i8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_agent: Option<UserAgent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backward: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forward: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub get_messages: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_ids: Option<Vec<String>>,
-}
-
-impl Default for Data {
-    fn default() -> Self {
-        Data {
-            interactive: None,
-            chats_count: None,
-            chats_sync: None,
-            drafts_sync: None,
-            presence_sync: None,
-            contacts_sync: None,
-            token: None,
-            device_id: None,
-            user_agent: None,
-            backward: None,
-            chat_id: None,
-            forward: None,
-            from: None,
-            get_messages: None,
-            message_id: None,
-            message_ids: None,
-        }
-    }
-}
-
-/// All the current user's names in max
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MaxSelfNames {
-    name: String,
-    first_name: String,
-    last_name: String,
-    #[serde(rename = "type")]
-    typ: String,
-}
-
-/// Structure that represents current user's data
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MaxSelfContact {
-    account_status: i8,
-    base_url: String,
-    names: Vec<MaxSelfNames>,
-    phone: i64,
-    options: Vec<String>,
-    photo_id: i64,
-    update_time: usize,
-    id: i64,
-    base_raw_url: String,
-}
-
-/// Struct used to describe current user's profile options
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MaxSelfProfile {
-    profile_options: Vec<i8>,
-    contact: MaxSelfContact,
-}
-
-/// Struct used to describe max chat option
-/// E.g. whether it's  official or not, some participants' privileges etc.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "UPPERCASE")]
-pub struct MaxChatOptions {
-    sign_admin: Option<bool>,
-    official: Option<bool>,
-    message_copy_not_allowed: Option<bool>,
-    only_owner_can_change_icon_title: Option<bool>,
-    only_admin_can_add_member: Option<bool>,
-    only_admin_can_call: Option<bool>,
-    sent_by_phone: Option<bool>,
-    content_level_chat: Option<bool>,
-    a_plus_channel: Option<bool>,
-    all_can_pin_message: Option<bool>,
-}
-
-/// Struct that represents all last message elements
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct LastMessageElement {
-    #[serde(rename = "type")]
-    typ: String,
-    length: i64,
-}
-
-/// Struct that represents last message in any chat(DM, GROUP, CHANNEL)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct LastMessage {
-    elements: Vec<LastMessageElement>,
-    options: i64,
-    id: i64,
-    time: usize,
-    text: String,
-    #[serde(rename = "type")]
-    typ: String,
-}
-
-/// Struct that represents max's chat that user is a participant of
-/// Can be used to retrieve all user's chats
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MaxChat {
-    participants_count: Option<i64>,
-    access: Option<String>,
-    invited_by: Option<i64>,
-    base_raw_icon_url: Option<String>,
-    link: Option<String>,
-    description: Option<String>,
-    #[serde(rename = "type")]
-    typ: String,
-    title: Option<String>,
-    last_fire_delayed_error_time: i64,
-    last_delayed_update_time: i64,
-    new_messages: Option<i64>,
-    options: Option<MaxChatOptions>,
-    modified: usize,
-    id: i64,
-    owner: i64,
-    join_time: usize,
-    created: usize,
-    restrictions: Option<i64>,
-    last_event_time: usize,
-    messages_count: Option<i64>,
-    base_icon_url: Option<String>,
-    status: String,
-    cid: Option<i64>,
-}
-
-/// Struct used to describe many max user's names due to max names system
-/// Each user can have their official name(As I understand it gets it from GosUslugi)
-/// and also their custom name
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ContactName {
-    name: String,
-    #[serde(rename = "type")]
-    typ: String,
-    first_name: String,
-}
-
-/// Struct that represents max user's contact
-/// Can be user to get list of user's contacts
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Contact {
-    account_status: i64,
-    names: Vec<ContactName>,
-    update_time: usize,
-    id: i64,
-}
-
-/// Structure that describes some of max's message fields
-/// Can be user to represent message or many messages and interact with them
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MaxMessage {
-    id: String,
-    sender: Option<i64>,
-    #[serde(skip)]
-    pub sender_name: Option<String>,
-    pub text: String,
-    time: usize,
-    #[serde(rename = "type")]
-    typ: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(untagged)]
-pub enum MaybeEmpty<T> {
-    Full(T),
-    Empty {},
-}
-
-/// This is a common struct used to parse max responses
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MaxResponse {
-    video_chat_history: Option<bool>,
-    profile: Option<MaxSelfProfile>,
-    chats: Option<Vec<MaxChat>>,
-    contacts: Option<Vec<Contact>>,
-    messages: Option<MaybeEmpty<Vec<MaxMessage>>>,
-    pub message: Option<MaxMessage>,
-    chat_id: Option<i64>,
-}
-
-/// Struct used to get max's response with payload
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ResponseState {
-    cmd: i8,
-    opcode: i64,
-    seq: i64,
-    ver: i8,
-    pub payload: MaxResponse,
-}
-
-/// Struct used to get max's response without payload
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ResponseHeaders {
-    cmd: i8,
-    opcode: i64,
-    seq: i64,
-    ver: i8,
-}
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct SeqType {
@@ -588,7 +347,7 @@ impl Provider {
             guard.next().await
         } {
             Some(Ok(Message::Text(text))) => text,
-            Some(Err(e)) => {
+            Some(Err(_)) => {
                 self.init_new_session().await?;
                 return Ok(());
             }
@@ -607,6 +366,9 @@ impl Provider {
                 return Ok(());
             }
         };
+        if cfg!(debug_assertions) {
+            println!("[HEADERS]\n{}\n", headers);
+        }
         let mut response: Option<ResponseState> = None;
         let opcode = headers.opcode;
         if opcode == 19 || opcode == 49 || opcode == 128 {
@@ -775,7 +537,6 @@ impl Provider {
     }
 
     async fn accept_interactions(&mut self) -> Result<(), Box<AsyncError>> {
-        // println!("Sending interactable true");
         self.send_data(
             Data {
                 interactive: Some(true),
@@ -798,14 +559,16 @@ mod tests {
     use min_rs_config::*;
     use tokio::test;
 
-    use crate::provider::{Data, Provider};
+    use crate::{provider::{Data, Provider}, types::UserAgent};
 
     #[test]
     async fn test_async_operation() {
         // Parse config file
-        let config = ConfigParser::parse_config_file("test_files/config.json").unwrap();
+        // let config = ConfigParser::parse_config_file("test_files/config.json").unwrap();
 
         dotenv().ok();
+
+        let headers = Headers::default();
 
         let token = env::var("TOKEN").expect("Token is required in .env file!");
 
@@ -814,7 +577,7 @@ mod tests {
 
         let user_agent_data = Data {
             device_id: Some("13977301-4cfd-4cb4-98b6-3536e0744015".to_string()),
-            user_agent: Some(config.max_agent),
+            user_agent: Some(UserAgent::default()),
             ..Default::default()
         };
 
@@ -831,7 +594,7 @@ mod tests {
 
         // Initialize the provider with the config and channel
         let _provider = Provider::new(
-            serde_json::to_string(&config.headers).unwrap(),
+            serde_json::to_string(&headers).unwrap(),
             "wss://ws-api.oneme.ru/websocket".to_string(),
             user_agent_data,
             auth_data,
